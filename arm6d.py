@@ -14,7 +14,8 @@ class OptimProblem:
     def __init__(self,rmodel,rdata,gview=None):
         self.rmodel = rmodel
         self.rdata = rdata
-        self.ref = [ .3, 0.3, 0.3 ]     # Target position
+        self.ref = pinocchio.SE3( rotate('x',np.pi),                 # Target orientation
+                                  np.matrix([ .3, 0.3, 0.3 ]).T)     # Target position
         self.idEff = -2                 # ID of the robot object to control
         self.initDisplay(gview)
         
@@ -22,15 +23,15 @@ class OptimProblem:
         q = a2m(x)
         pinocchio.forwardKinematics(self.rmodel,self.rdata,q)
         M = self.rdata.oMi[self.idEff]
-        self.residuals = m2a(M.translation) - self.ref
+        self.residuals = m2a( pinocchio.log(M.inverse()*self.ref).vector )
         return sum( self.residuals**2 )
 
     def initDisplay(self,gview=None):
         self.gview = gview
         if gview is None: return
-        self.gobj = "world/target3d"
-        self.gview.addSphere(self.gobj,.03,[1,0,0,1])
-        self.gview.applyConfiguration(self.gobj,self.ref+[0,0,0,1])
+        self.gobj = "world/target6d"
+        self.gview.addBox(self.gobj,.1,0.05,0.025,[1,0,0,1])
+        self.gview.applyConfiguration(self.gobj,se3ToXYZQUAT(self.ref))
         self.gview.refresh()
 
     def callback(self,x):
@@ -42,7 +43,7 @@ class OptimProblem:
 pbm = OptimProblem(robot.model,robot.model.createData(),robot.viewer.gui)
 
 x0  = m2a(robot.q0)
-result = fmin_slsqp(x0=x0,
+result = fmin_slsqp(x0=x0,acc=1e-9,
                     func=pbm.cost,
                     callback=pbm.callback)
 qopt = a2m(result)
