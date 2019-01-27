@@ -46,7 +46,7 @@ class OptimProblem:
         
     def pinocchioCalc(self,x):
         if x is not self.x:
-            self.x = x
+            #self.x = x
             vq = a2m(x)
             q = self.vq2q(vq)
             pinocchio.forwardKinematics(self.rmodel,self.rdata,q)
@@ -54,7 +54,7 @@ class OptimProblem:
 
     def pinocchioCalcDiff(self,x):
         if x is not self.xdiff:
-            self.xdiff = x
+            #self.xdiff = x
             vq = a2m(x)
             q = self.vq2q(vq)
             pinocchio.computeJointJacobians(self.rmodel,self.rdata,q)
@@ -85,7 +85,7 @@ class OptimProblem:
 
     def constraint_rightfoot(self,x,nc=0):
         self.pinocchioCalc(x)
-        refMr = self.refL.inverse()*self.rdata.oMf[self.idR]
+        refMr = self.refR.inverse()*self.rdata.oMf[self.idR]
         self.eq[nc:nc+6] = m2a(pinocchio.log(refMr).vector)
         return self.eq[nc:nc+6].tolist()
 
@@ -96,15 +96,15 @@ class OptimProblem:
     
     def dConstraint_dx_leftfoot(self,x,nc=0):
         self.pinocchioCalcDiff(x)
-        rMl = self.refL.inverse()*self.rdata.oMf[self.idL]
-        log_M = pinocchio.Jlog6(rMl)
+        refMl = self.refL.inverse()*self.rdata.oMf[self.idL]
+        log_M = pinocchio.Jlog6(refMl)
         M_q = pinocchio.getFrameJacobian(self.rmodel,self.rdata,self.idL,LOCAL)
         self.Jeq[nc:nc+6,:] = log_M*M_q*self.Q_v
         return self.Jeq[nc:nc+6,:]
 
     def dConstraint_dx_rightfoot(self,x,nc=0):
         self.pinocchioCalcDiff(x)
-        refMr = self.refL.inverse()*self.rdata.oMf[self.idR]
+        refMr = self.refR.inverse()*self.rdata.oMf[self.idR]
         log_M = pinocchio.Jlog6(refMr)
         M_q = pinocchio.getFrameJacobian(self.rmodel,self.rdata,self.idR,LOCAL)
         self.Jeq[nc:nc+6,:] = log_M*M_q*self.Q_v
@@ -161,5 +161,5 @@ assert(norm(Ja-Jn)<1e-4)
 
 
 res = fmin_slsqp(func=pbm.costQ,x0=x0,f_eqcons=pbm.constraint,epsilon=1e-6,callback=pbm.callback)
-res = fmin_slsqp(func=pbm.costQ,x0=x0,f_eqcons=pbm.constraint,fprime_eqcons=pbm.dConstraint_dx,callback=pbm.callback,iter=3)
+res = fmin_slsqp(func=pbm.costQ,x0=x0,f_eqcons=pbm.constraint,fprime_eqcons=pbm.dConstraint_dx,callback=pbm.callback,iter=300,fprime=pbm.dCostQ_dx)
 qopt = pbm.vq2q(a2m(res))
