@@ -13,8 +13,9 @@ a2m = lambda a: np.matrix(a).T
 LOCAL = pinocchio.ReferenceFrame.LOCAL
 WORLD = pinocchio.ReferenceFrame.WORLD
 
-robot.initDisplay(loadModel=True)
-gview = robot.viewer.gui
+#robot.initDisplay(loadModel=True)
+#gview = robot.viewer.gui
+gview = None
 
 class OptimProblem:
     def __init__(self,rmodel,rdata,gview=None):
@@ -35,51 +36,83 @@ class OptimProblem:
         self.neq = 12
         self.eq = np.zeros(self.neq)
         self.Jeq = np.zeros([self.neq, self.rmodel.nv])
+
+        # configurations are represented as velocity integrated from this point.
+        self.q0 = rmodel.neutralConfiguration
+
+    def vq2q(self,vq):   return pinocchio.integrate(rmodel,self.q0,vq)
+    def q2vq(self,q):    return pinocchio.difference(rmodel,self.q0,q)
+    def dq_dv(self,vq):  return pinocchio.dIntegrate(rmodel,self.q0,vq)[1]
         
     def pinocchioCalc(self,x):
         if x is not self.x:
             self.x = x
-            q = a2m(x)
+            vq = a2m(x)
+            q = self.vq2q(vq)
             pinocchio.forwardKinematics(self.rmodel,self.rdata,q)
             pinocchio.updateFramePlacements(self.rmodel,self.rdata)
 
     def pinocchioCalcDiff(self,x):
         if x is not self.xdiff:
             self.xdiff = x
-            q = a2m(x)
-            pinocchio.computeJointJacobians(self.rmodel,self.rdata)
+            vq = a2m(x)
+            q = self.vq2q(vq)
+            pinocchio.computeJointJacobians(self.rmodel,self.rdata,q)
             pinocchio.updateFramePlacements(self.rmodel,self.rdata)
+            self.Q_v = self.dq_dv(vq)
         
     def costQ(self,x):
         self.pinocchioCalc(x)
-        q = a2m(x)
-        self.residuals[:] = pinocchio.difference(self.rmodel,q,self.refQ)[6:].flat
+        q = self.vq2q(a2m(x))
+        self.residuals[:] = pinocchio.difference(self.rmodel,self.refQ,q)[6:].flat
         return sum( self.residuals**2 )
-        
-    def constraint_leftfoot(self,x):
-        self.pinocchioCalc(x)
-        q = a2m(x)
-        Ml = self.rdata.oMf[self.idL]
-        self.eq[:6] = m2a(pinocchio.log(Ml.inverse()*self.refL).vector)
-        return self.eq[:6].tolist()
 
-    def constraint_rightfoot(self,x):
+    def dCostQ_dx(self,x):
+        self.pinocchioCalcDiff(x)
+        q = self.vq2q(a2m(x))
+        # ddiff_dx2(x1,x2) = dint_dv(x1,x2-x1)^-1
+        # ddiff_dq( refQ,q) = dint_dv(refQ,q-refQ)
+        dq = pinocchio.difference(self.rmodel,self.refQ,q)
+        dDiff = inv(pinocchio.dIntegrate(rmodel,self.refQ,dq)[1])
+        grad = dDiff[6:,:].T*dq[6:]
+        return m2a(grad)
+        
+    def constraint_leftfoot(self,x,nc=0):
         self.pinocchioCalc(x)
-        q = a2m(x)
-        Mr = self.rdata.oMf[self.idR]
-        self.eq[6:12] = m2a(pinocchio.log(Mr.inverse()*self.refR).vector)
-        return self.eq[6:12].tolist()
+        refMl = self.refL.inverse()*self.rdata.oMf[self.idL]
+        self.eq[nc:nc+6] = m2a(pinocchio.log(refMl).vector)
+        return self.eq[nc:nc+6].tolist()
+
+    def constraint_rightfoot(self,x,nc=0):
+        self.pinocchioCalc(x)
+        refMr = self.refL.inverse()*self.rdata.oMf[self.idR]
+        self.eq[nc:nc+6] = m2a(pinocchio.log(refMr).vector)
+        return self.eq[nc:nc+6].tolist()
 
     def constraint(self,x):
-        self.constraint_rightfoot(x)
-        self.constraint_leftfoot(x)
+        self.constraint_rightfoot(x,0)
+        self.constraint_leftfoot(x,6)
         return self.eq.tolist()
     
-    def Jeq_leftfoot(self,x):
+    def dConstraint_dx_leftfoot(self,x,nc=0):
         self.pinocchioCalcDiff(x)
-        Rl = self.rdata.oMf[self.idL].rotation
-        J6 = pinocchio.getFrameJacobian(rmodel,rdata,self.idL,pinocchio.ReferenceFrame.LOCAL)
-        self.Jeq[:3,:] = Rl*J6[:3,:]
+        rMl = self.refL.inverse()*self.rdata.oMf[self.idL]
+        log_M = pinocchio.Jlog6(rMl)
+        M_q = pinocchio.getFrameJacobian(self.rmodel,self.rdata,self.idL,LOCAL)
+        self.Jeq[nc:nc+6,:] = log_M*M_q*self.Q_v
+        return self.Jeq[nc:nc+6,:]
+
+    def dConstraint_dx_rightfoot(self,x,nc=0):
+        self.pinocchioCalcDiff(x)
+        refMr = self.refL.inverse()*self.rdata.oMf[self.idR]
+        log_M = pinocchio.Jlog6(refMr)
+        M_q = pinocchio.getFrameJacobian(self.rmodel,self.rdata,self.idR,LOCAL)
+        self.Jeq[nc:nc+6,:] = log_M*M_q*self.Q_v
+        return self.Jeq[nc:nc+6,:]
+
+    def dConstraint_dx(self,x):
+        self.dConstraint_dx_rightfoot(x,0)
+        self.dConstraint_dx_leftfoot(x,6)
         return self.Jeq
         
     # --- BLABLA -------------------------------------------------------------
@@ -94,11 +127,10 @@ class OptimProblem:
         self.gview.applyConfiguration(self.gobjL,se3ToXYZQUAT(self.refL))
         self.gview.refresh()
     def callback(self,x):
-        pass            
+        print self.costQ(x),sum([ c**2 for c in self.constraint(x) ])
 
 
-def checkNumDiff(f,J,x):
-    pass
+
 
     
 #for i,f in enumerate(rmodel.frames): print i,f.name
@@ -108,199 +140,26 @@ robot.q0 = rmodel.neutralConfiguration
 pbm = OptimProblem(rmodel,rdata,gview)
 x0  = m2a(robot.q0)
 
-#res = fmin_slsqp(func=pbm.costQ,x0=x0,f_eqcons=pbm.constraint,epsilon=1e-6)
-#qopt = a2m(res)
-
-''' 
-H =
- w  -z   y
- z   w  -x
--y   x   w
--x  -y  -z
-
-
-[i]w = H*delta_q  
-
-''' 
-
-q = rmodel.neutralConfiguration.copy()
-q.flat[3:7] = [.1,.2,.3,.4]
-q[3:7] /= norm(q[3:7])
-dq = q*0
-h = 1e-6
-pinocchio.forwardKinematics(rmodel,rdata,q)
-M0 = rdata.oMi[1].copy()
-J= zero([6,4])
-for i in range(3,7):
-    dq[i] = h
-    pinocchio.forwardKinematics(rmodel,rdata,q+dq)
-    dq[i]=0
-    J[:,i-3] = pinocchio.log(M0.inverse()*rdata.oMi[1]).vector/h
-
-
-def ch(q4):
-    q = rmodel.neutralConfiguration.copy()
-    q.flat[3:7] = q4
-    q[3:7] /= norm(q[3:7])
-    print q[3:7].T
-    dq = q*0
-    h = 1e-6
-    pinocchio.forwardKinematics(rmodel,rdata,q)
-    M0 = rdata.oMi[1].copy()
-    J = zero([6,4])
-    for i in range(3,7):
-        dq[i] = h
-        pinocchio.forwardKinematics(rmodel,rdata,q+dq)
-        dq[i]=0
-        J[:,i-3] = pinocchio.log(M0.inverse()*rdata.oMi[1]).vector/h
+# ------------------------------------------------------
+def checkNumDiff(f,x,h=1e-6):
+    f0 = np.array(f(x))
+    nf,nx = len(f0),len(x)
+    dx = np.zeros(nx)
+    J = np.zeros([ nf,nx ])
+    for i in range(nx):
+        dx[i] = h
+        J[:,i] = (np.array(f(x+dx))-f0)/h
+        dx[i] = 0
     return J
 
-
-    
-
-pinocchio.computeJointJacobians(rmodel,rdata,q)
-J3=pinocchio.getJointJacobian(rmodel,rdata,1,LOCAL)[3:,3:6]
-
-def w_q(q):
-    if isinstance(q,np.ndarray): q = v2q(q)
-    return pinocchio.log3(q.matrix())
-
-v2q = lambda v_: pinocchio.Quaternion(v_[3,0],*v_[1:].flat)
-q2v = lambda q_: q_.coeffs()
-
-def dw_dq(q,h=1e-6):
-    dq = zero(4)
-    J = zero([3,4])
-    for i in range(4):
-        dq[i]=h
-        J[:,i] = pinocchio.log3( v2q(q).matrix().T*v2q(q+dq).matrix() )/h
-        dq[i]=0
-    return J
-'''
-dw = dw/dq dq
-R(q+dq) = R(q) + exp(dw)
-'''
-# q = rand(4); q/=norm(q)
-# dq = rand(4)*1e-3
-# assert( norm( pinocchio.log3(inv(v2q(q+dq).matrix()) \
-#                              * v2q(q).matrix()*pinocchio.exp3(dw_dq(q)*dq)) )<1e-1 )
+x0  = m2a(pbm.q2vq(robot.q0))
+x0  = np.random.rand(rmodel.nv)
+Ja = pbm.dConstraint_dx(x0)
+Jn = checkNumDiff(pbm.constraint,x0,h=1e-9)
+assert(norm(Ja-Jn)<1e-4)
+# ------------------------------------------------------
 
 
-# q = pinocchio.randomConfiguration(rmodel)
-# w = rand(3)*1e-2
-# vq = zero(rmodel.nv); vq[3:6] = w
-
-# pinocchio.forwardKinematics(rmodel,rdata,q)
-# M = rdata.oMi[1].copy()
-# pinocchio.forwardKinematics(rmodel,rdata,pinocchio.integrate(rmodel,q,vq))
-# Md = rdata.oMi[1].copy()
-# assert( norm( M.rotation*pinocchio.exp3(w) - Md.rotation ) <1e-6 )
-
-# dq = zero(rmodel.nq)
-# dq4 = rand(4) * 1e-4
-# dq[3:7] = dq4
-
-# pinocchio.forwardKinematics(rmodel,rdata,q)
-# M = rdata.oMi[1].copy()
-# pinocchio.forwardKinematics(rmodel,rdata,q+dq)
-# Md = rdata.oMi[1].copy()
-# #assert( norm( M.rotation*pinocchio.exp3(w) - Md.rotation ) <1e-6 )
-IDX = 13
-
-def f(q_):
-    pinocchio.forwardKinematics(rmodel,rdata,q_)
-    return rdata.oMi[IDX].translation
-
-def df_dq(q,h=1e-6):
-    ndq = rmodel.nq
-    dq = zero(ndq)
-    f0 = f(q)
-    J = zero([len(f0),ndq])
-    for i in range(ndq):
-        dq[i]=h
-        J[:,i] = (f(q+dq)-f0)/h
-        dq[i]=0
-    return J
-
-def df_dv(q,h=1e-6):
-    ndq = rmodel.nv
-    dq = zero(ndq)
-    f0 = f(q)
-    J = zero([len(f0),ndq])
-    for i in range(ndq):
-        dq[i]=h
-        J[:,i] = (f(pinocchio.integrate(rmodel,q,dq))-f0)/h
-        dq[i]=0
-    return J
-
-assert( norm( df_dv(q)[:,:3]-rdata.oMi[1].rotation) < 1e-6 )
-assert( norm( df_dv(q)[:,6:]-df_dq(q)[:,7:]) < 1e-6 )
-
-Fv= df_dv(q)[:,3:6]
-Fq= df_dq(q)[:,3:7]
-H = dw_dq(q[3:7])
-
-pinocchio.computeJointJacobians(rmodel,rdata,q)
-J6=pinocchio.getJointJacobian(rmodel,rdata,IDX,LOCAL)
-J3=pinocchio.getJointJacobian(rmodel,rdata,IDX,LOCAL)[:3,3:6]
-
-assert( norm( rdata.oMi[-1].rotation*J3 - Fv ) < 1e-6 )
-
-#w = rand(3)*1e-3 
-q4 = q[3:7]
-dq4 = rand(4)*1e-2
-dq = zero(rmodel.nq); dq[3:7] = dq4
-#w = w_q(dq4)
-w = dw_dq(q4)*dq4
-vq = zero(rmodel.nv); vq[3:6] = w 
-
-IDX = 1
-pinocchio.forwardKinematics(rmodel,rdata,q); M = rdata.oMi[IDX].copy()
-pinocchio.forwardKinematics(rmodel,rdata,q+dq); Mq = rdata.oMi[IDX].copy()
-pinocchio.forwardKinematics(rmodel,rdata,pinocchio.integrate(rmodel,q,vq)); Mv = rdata.oMi[IDX].copy()
-
-assert( norm( M.rotation*pinocchio.exp3(w) - Mv.rotation ) < 1e-6 )
-
-
-# ==============================================
-IDX = 1
-
-vq2q = lambda vq: pinocchio.integrate(rmodel,rmodel.neutralConfiguration,vq)
-q2vq = lambda q: pinocchio.difference(rmodel,rmodel.neutralConfiguration,q)
-
-
-def f(v):
-    pinocchio.forwardKinematics(rmodel,rdata,vq2q(v))
-    return rdata.oMi[IDX].translation
-
-def df_dq(v,h=1e-6):
-    ndq = rmodel.nv
-    dq = zero(ndq)
-    f0 = f(v)
-    J = zero([len(f0),ndq])
-    for i in range(ndq):
-        dq[i]=h
-        J[:,i] = (f(v+dq)-f0)/h
-        dq[i]=0
-    return J
-
-v = rand(rmodel.nv)
-dv = zero(rmodel.nv)
-
-
-
-'''
-f(v) = f(q(v))
-df/dv = T_q f T_v q = F_q Q_v
-
-
-
-
-'''
-
-pinocchio.computeJointJacobians(rmodel,rdata,vq2q(v))
-J6=pinocchio.getJointJacobian(rmodel,rdata,IDX,LOCAL)
-F_q=rdata.oMi[IDX].rotation*pinocchio.getJointJacobian(rmodel,rdata,IDX,LOCAL)[:3,:]
-Q_v = pinocchio.dIntegrate(rmodel,rmodel.neutralConfiguration,v)[1]
-
-
+res = fmin_slsqp(func=pbm.costQ,x0=x0,f_eqcons=pbm.constraint,epsilon=1e-6,callback=pbm.callback)
+res = fmin_slsqp(func=pbm.costQ,x0=x0,f_eqcons=pbm.constraint,fprime_eqcons=pbm.dConstraint_dx,callback=pbm.callback,iter=3)
+qopt = pbm.vq2q(a2m(res))
