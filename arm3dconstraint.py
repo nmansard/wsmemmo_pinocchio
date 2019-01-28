@@ -14,30 +14,35 @@ class OptimProblem:
     def __init__(self,rmodel,rdata,gview=None):
         self.rmodel = rmodel
         self.rdata = rdata
-        self.ref = pinocchio.SE3( rotate('x',np.pi),                 # Target orientation
-                                  np.matrix([ .3, 0.3, 0.3 ]).T)     # Target position
+        self.refEff = [ .3, 0.3, 0.3 ]     # Target position
         self.idEff = rmodel.getFrameId('gripper_left_fingertip_2_link')
+        self.refQ = rmodel.neutralConfiguration
         self.initDisplay(gview)
         
     def cost(self,x):
         q = a2m(x)
+        self.residuals = m2a(q-self.refQ)
+        return sum(self.residuals**2)
+
+    def constraint(self,x):
+        q = a2m(x)
         pinocchio.forwardKinematics(self.rmodel,self.rdata,q)
         pinocchio.updateFramePlacements(self.rmodel,self.rdata)
         M = self.rdata.oMf[self.idEff]
-        self.residuals = m2a( pinocchio.log(M.inverse()*self.ref).vector )
-        return sum( self.residuals**2 )
+        self.eq = m2a(M.translation) - self.refEff
+        return self.eq.flat
 
     @property
     def bounds(self):
-        return [ (l,u) for l,u in zip(self.rmodel.lowerPositionLimit.flat,
+        return [ (10*l,u) for l,u in zip(self.rmodel.lowerPositionLimit.flat,
                                       self.rmodel.upperPositionLimit.flat) ]
 
     def initDisplay(self,gview=None):
         self.gview = gview
         if gview is None: return
-        self.gobj = "world/target6d"
-        self.gview.addBox(self.gobj,.1,0.05,0.025,[1,0,0,1])
-        self.gview.applyConfiguration(self.gobj,se3ToXYZQUAT(self.ref))
+        self.gobj = "world/target3d"
+        self.gview.addSphere(self.gobj,.03,[1,0,0,1])
+        self.gview.applyConfiguration(self.gobj,self.refEff+[0,0,0,1])
         self.gview.refresh()
 
     def callback(self,x):
@@ -46,12 +51,11 @@ class OptimProblem:
         robot.display(q)
         time.sleep(1e-2)
 
-        
 pbm = OptimProblem(robot.model,robot.model.createData(),robot.viewer.gui)
 
 x0  = m2a(robot.q0)
-result = fmin_slsqp(x0=x0,acc=1e-9,
-                    func=pbm.cost,
-                    callback=pbm.callback,
-                    bounds=pbm.bounds)
+result = fmin_slsqp(x0       = x0,
+                    func     = pbm.cost,
+                    f_eqcons = pbm.constraint,
+                    callback = pbm.callback)
 qopt = a2m(result)
